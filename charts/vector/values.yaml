@@ -15,7 +15,7 @@ fullnameOverride: ""
 # Agent = DaemonSet
 # Aggregator = StatefulSet
 # Stateless-Aggregator = Deployment
-role: "Aggregator"
+role: "Agent"
 
 # rollWorkload -- Add a checksum of the generated ConfigMap to workload annotations.
 rollWorkload: true
@@ -26,13 +26,14 @@ commonLabels: {}
 # Define the Vector image to use.
 image:
   # image.repository -- Override default registry and name for Vector's image.
-  repository: timberio/vector
+  repository: dockerhub.kb.cz/ps-sq002/timberio/vector
   # image.pullPolicy -- The [pullPolicy](https://kubernetes.io/docs/concepts/containers/images/#image-pull-policy) for
   # Vector's image.
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
   # image.pullSecrets -- The [imagePullSecrets](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
   # to reference for the Vector Pods.
-  pullSecrets: []
+  pullSecrets:
+   - name: dockerhub 
   # image.tag -- The tag to use for Vector's image.
   # @default -- Derived from the Chart's appVersion.
   tag: ""
@@ -146,7 +147,17 @@ args:
   - "/etc/vector/"
 
 # env -- Set environment variables for Vector containers.
-env: []
+env: 
+  - name: 'KAFKA_TOPIC_NAME'
+    valueFrom:
+      secretKeyRef:
+        name: kb-logging-secret
+        key: topicName
+  - name: 'TLS_KEY_PASSPHRASE'
+    valueFrom:
+      secretKeyRef:
+        name: kb-logging-secret
+        key: cert_key_passphrase
   # - name: MY_VARIABLE
   #   valueFrom:
   #     secretKeyRef:
@@ -288,7 +299,91 @@ dataDir: ""
 # customConfig -- Override Vector's default configs, if used **all** options need to be specified. This section supports
 # using helm templates to populate dynamic values. See Vector's [configuration documentation](https://vector.dev/docs/reference/configuration/)
 # for all options.
-customConfig: {}
+customConfig:
+  api:
+    enabled: true
+    address: 127.0.0.1:8686
+    playground: false
+  sources:
+    containers:
+      data_dir: /var/log/vector-storage/
+      type: kubernetes_logs
+      auto_partial_merge: true
+      use_apiserver_cache: true
+      namespace_annotation_fields:
+        #namespace_labels: ".kubernetes.namespace.labels"
+        namespace_labels: ".kubernetes.namespace_labels"
+        #namespace_labels: ""
+      node_annotation_fields:
+        node_labels: ""
+      pod_annotation_fields: 
+        container_id: ".kubernetes.container.id"
+        #container_id: ".kubernetes.docker.id"
+        container_image: ".kubernetes.container.image"
+        container_image_id: ".kubernetes.container.image_id"
+        container_name: ".kubernetes.container.name"
+        pod_annotations: ".kubernetes.annotations"
+        pod_ips: ""
+        pod_labels: ".kubernetes.labels"
+        pod_name: ".kubernetes.pod.name"
+        pod_namespace: ".kubernetes.namespace"
+        pod_node_name: ".kubernetes.node.name"
+        pod_owner: ".kubernetes.pod.owner"
+        pod_uid: ".kubernetes.pod.id"
+        pod_ip: "kubernetes.pod.ip"
+  transforms:
+    transka_1:
+      type: remap
+      inputs:
+        - containers
+      source: |-
+        .@timestamp = .timestamp
+        del(.timestamp)
+        del(.file)
+        del(.timestamp_end)
+        .topic = "${KAFKA_TOPIC_NAME}"
+        . = map_keys(. , recursive: true) -> |key| { replace(key, ".", "_") }
+
+    #transka_2:
+    #  type: remap
+    #  inputs:
+    #    - transka_1
+    #  source: |-
+    #    . = map_keys(. , recursive: true) -> |key| { replace(key, ".", "_") }
+
+
+  sinks:
+    kafka:
+      type: kafka
+      inputs:
+        - transka_1
+      bootstrap_servers: "kafka-logman-ha-test.kb.cz:9093" 
+      #bootstrap_servers: my-kafka-cluster-kafka-external-bootstrap.speed-infra:9094
+      compression: none
+      headers_key: header
+      headers_key: header
+      key_field: user_id
+      encoding:
+        codec: json
+        timestamp_format: rfc3339
+      librdkafka_options:
+        client.id: test
+        request.required.acks: "1"
+      message_timeout_ms: 300000
+      socket_timeout_ms: 60000
+      topic: ${KAFKA_TOPIC_NAME}
+      tls:
+        enabled: true
+        #enabled: false
+        ca_file: /usr/share/kafka/certs/ca.pem
+        crt_file: /usr/share/kafka/certs/cert.pem
+        key_file: /usr/share/kafka/certs/cert.key
+        key_pass: ${TLS_KEY_PASSPHRASE}
+        verify_certificate: false
+      acknowledgements:
+        enabled: true
+
+
   # data_dir: /vector-data-dir
   # api:
   #   enabled: true
@@ -307,10 +402,20 @@ customConfig: {}
   #       codec: json
 
 # extraVolumes -- Additional Volumes to use with Vector Pods.
-extraVolumes: []
+extraVolumes: 
+  - name: varlog
+    hostPath:
+      path: /var/log
+  - name: kafka-tls
+    secret:
+      secretName: kb-logging-secret
 
 # extraVolumeMounts -- Additional Volume to mount into Vector Containers.
-extraVolumeMounts: []
+extraVolumeMounts: 
+  - name: varlog
+    mountPath: /var/log
+  - name: kafka-tls
+    mountPath: /usr/share/kafka/certs
 
 # initContainers -- Init Containers to be added to the Vector Pods.
 initContainers: []
@@ -342,7 +447,7 @@ persistence:
   hostPath:
     # persistence.hostPath.path -- Override path used for hostPath persistence. Valid for the "Agent" role, persistence
     # is always used for the "Agent" role.
-    path: "/var/lib/vector"
+    path: "/var/log/vector-storage/"
 
 # dnsPolicy -- Specify the [dnsPolicy](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy)
 # for Vector Pods.
